@@ -1,5 +1,8 @@
+import { decompressLzmaRaw } from './lzma-raw'
 import { bufToHex, HASH_7Z_BLOCK_MAX_BYTES } from './types'
 import type { HashPackage } from './types'
+
+
 
 export function inspectRarOr7z(buffer: ArrayBuffer, fileName: string): HashPackage {
   const bytes = new Uint8Array(buffer)
@@ -142,19 +145,315 @@ function parse7z(bytes: Uint8Array, fileName: string): HashPackage {
     }
   }
 
-  // 3. 文件名未加密且体积在 64KB 安全范围内
+  // 3. 文件名未加密且体积在 64KB 安全范围内：浏览器纯前端本地秒级解析提取 Mode 11600 哈希
+  return extract7zType1Hash(bytes, nextHeader, fileName)
+}
+
+
+function read7zNumber(bytes: Uint8Array, offset: { val: number }): number {
+  if (offset.val >= bytes.length) return 0
+  const first = bytes[offset.val++]
+  if ((first & 0x80) === 0) return first
+  let value = bytes[offset.val++]
+  for (let i = 1; i < 8; i++) {
+    const mask = 0x80 >> i
+    if ((first & mask) === 0) {
+      const high = first & (mask - 1)
+      value |= high << (i * 8)
+      return value
+    }
+    const next = bytes[offset.val++]
+    value |= next << (i * 8)
+  }
+  return value
+}
+
+function readUInt32LE(bytes: Uint8Array, offset: number): number {
+  return (
+    (bytes[offset] |
+      (bytes[offset + 1] << 8) |
+      (bytes[offset + 2] << 16) |
+      (bytes[offset + 3] << 24)) >>>
+    0
+  )
+}
+
+function extract7zType1Hash(bytes: Uint8Array, nextHeader: Uint8Array, fileName: string): HashPackage {
+  let rawHeader = nextHeader
+
+  // 若头部被 LZMA 压缩 (kEncodedHeader = 0x17)，先在前端本地解压出目录头结构
+  if (nextHeader.length > 0 && nextHeader[0] === 0x17) {
+    const offset = { val: 1 }
+    let hdrPackPos = 0
+    let hdrPackSize = 0
+    let lzmaProps: Uint8Array | null = null
+    let hdrUnpackSize = 0
+
+    while (offset.val < nextHeader.length) {
+      const id = nextHeader[offset.val++]
+      if (id === 0x00) break // kEnd
+      if (id === 0x06) {
+        // kPackInfo
+        hdrPackPos = read7zNumber(nextHeader, offset)
+        read7zNumber(nextHeader, offset) // numPackStreams
+        while (offset.val < nextHeader.length) {
+          const subId = nextHeader[offset.val++]
+          if (subId === 0x00) break
+          if (subId === 0x09) {
+            // kSize
+            hdrPackSize = read7zNumber(nextHeader, offset)
+          }
+        }
+      } else if (id === 0x07) {
+        // kUnpackInfo
+        while (offset.val < nextHeader.length) {
+          const subId = nextHeader[offset.val++]
+          if (subId === 0x00) break
+          if (subId === 0x0b) {
+            // kFolder
+            read7zNumber(nextHeader, offset) // numFolders
+            offset.val++ // external
+            const numCoders = read7zNumber(nextHeader, offset)
+            for (let i = 0; i < numCoders; i++) {
+              const flags = nextHeader[offset.val++]
+              const codecIdSize = flags & 0x0f
+              const isComplex = (flags & 0x10) !== 0
+              const hasAttributes = (flags & 0x20) !== 0
+              offset.val += codecIdSize
+              if (isComplex) {
+                read7zNumber(nextHeader, offset)
+                read7zNumber(nextHeader, offset)
+              }
+              if (hasAttributes) {
+                const attrSize = read7zNumber(nextHeader, offset)
+                lzmaProps = nextHeader.slice(offset.val, offset.val + attrSize)
+                offset.val += attrSize
+              }
+            }
+          } else if (subId === 0x0c) {
+            // kCodersUnpackSize
+            hdrUnpackSize = read7zNumber(nextHeader, offset)
+          } else if (subId === 0x0a) {
+            // kCRC
+            offset.val += 5
+          }
+        }
+      }
+    }
+
+    if (!lzmaProps || lzmaProps.length === 0) {
+      throw new Error('未识别的 7z 压缩头属性')
+    }
+
+    // 构造标准 13 字节 LZMA Alone Header: [5 字节 LZMA 参数] + [8 字节 64 位解压大小] + [压缩数据]
+    const lzmaStream = new Uint8Array(lzmaProps.length + 8 + hdrPackSize)
+    lzmaStream.set(lzmaProps, 0)
+    const view = new DataView(lzmaStream.buffer, lzmaStream.byteOffset, lzmaStream.byteLength)
+    view.setBigUint64(lzmaProps.length, BigInt(hdrUnpackSize), true)
+    const compressedData = bytes.slice(32 + hdrPackPos, 32 + hdrPackPos + hdrPackSize)
+    lzmaStream.set(compressedData, lzmaProps.length + 8)
+
+    rawHeader = decompressLzmaRaw(lzmaStream)
+  }
+
+  // 深度解析 rawHeader 提取 AES-256 加密流与校验信息
+  const offset = { val: 1 } // 跳过 0x01 (kHeader)
+  let packPos = 0
+  let packSize = 0
+  let aesCoder: { codecId: Uint8Array; attributes: Uint8Array } | null = null
+  let secondCoder: { codecId: Uint8Array; attributes: Uint8Array | null } | null = null
+  let aesUnpackSize = 0
+  let secondUnpackSize = 0
+  let crc = 0
+
+  while (offset.val < rawHeader.length) {
+    const id = rawHeader[offset.val++]
+    if (id === 0x00) break
+    if (id === 0x04) {
+      // kMainStreamsInfo
+      while (offset.val < rawHeader.length) {
+        const subId = rawHeader[offset.val++]
+        if (subId === 0x00) break
+        if (subId === 0x06) {
+          // kPackInfo
+          packPos = read7zNumber(rawHeader, offset)
+          read7zNumber(rawHeader, offset) // numPackStreams
+          while (offset.val < rawHeader.length) {
+            const pId = rawHeader[offset.val++]
+            if (pId === 0x00) break
+            if (pId === 0x09) {
+              // kSize
+              packSize = read7zNumber(rawHeader, offset)
+            }
+          }
+        } else if (subId === 0x07) {
+          // kUnpackInfo
+          while (offset.val < rawHeader.length) {
+            const uId = rawHeader[offset.val++]
+            if (uId === 0x00) break
+            if (uId === 0x0b) {
+              // kFolder
+              read7zNumber(rawHeader, offset) // numFolders
+              offset.val++ // external
+              const numCoders = read7zNumber(rawHeader, offset)
+              for (let i = 0; i < numCoders; i++) {
+                const flags = rawHeader[offset.val++]
+                const codecIdSize = flags & 0x0f
+                const isComplex = (flags & 0x10) !== 0
+                const hasAttributes = (flags & 0x20) !== 0
+                const codecId = rawHeader.slice(offset.val, offset.val + codecIdSize)
+                offset.val += codecIdSize
+                if (isComplex) {
+                  read7zNumber(rawHeader, offset)
+                  read7zNumber(rawHeader, offset)
+                }
+                let attributes: Uint8Array | null = null
+                if (hasAttributes) {
+                  const attrSize = read7zNumber(rawHeader, offset)
+                  attributes = rawHeader.slice(offset.val, offset.val + attrSize)
+                  offset.val += attrSize
+                }
+                const isAes =
+                  codecId.length === 4 &&
+                  codecId[0] === 0x06 &&
+                  codecId[1] === 0xf1 &&
+                  codecId[2] === 0x07 &&
+                  codecId[3] === 0x01
+
+                if (isAes) {
+                  aesCoder = { codecId, attributes: attributes || new Uint8Array(0) }
+                } else {
+                  secondCoder = { codecId, attributes }
+                }
+              }
+              const numBindPairs = numCoders - 1
+              for (let i = 0; i < numBindPairs; i++) {
+                read7zNumber(rawHeader, offset)
+                read7zNumber(rawHeader, offset)
+              }
+            } else if (uId === 0x0c) {
+              // kCodersUnpackSize
+              aesUnpackSize = read7zNumber(rawHeader, offset)
+              secondUnpackSize = read7zNumber(rawHeader, offset)
+            }
+          }
+        } else if (subId === 0x08) {
+          // kSubStreamsInfo
+          while (offset.val < rawHeader.length) {
+            const sId = rawHeader[offset.val++]
+            if (sId === 0x00) break
+            if (sId === 0x0a) {
+              // kCRC
+              const allDef = rawHeader[offset.val++]
+              if (allDef === 0x01 || allDef === 0x00) {
+                crc = readUInt32LE(rawHeader, offset.val)
+                offset.val += 4
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (!aesCoder || !aesCoder.attributes || aesCoder.attributes.length === 0) {
+    throw new Error('该 7z 压缩包未设置密码或未检测到 AES 加密流')
+  }
+
+  // 解码 AES 属性 (Cycles, Salt, IV)
+  const attr = aesCoder.attributes
+  const firstByte = attr[0]
+  const numCyclesPower = firstByte & 0x3f
+  let saltLen = (firstByte >> 7) & 1
+  let ivLen = (firstByte >> 6) & 1
+  let aOff = 1
+  if ((firstByte & 0xc0) !== 0) {
+    const secondByte = attr[1]
+    aOff++
+    saltLen += secondByte >> 4
+    ivLen += secondByte & 0x0f
+  }
+  const saltBuf = attr.slice(aOff, aOff + saltLen)
+  aOff += saltLen
+  let ivBuf = attr.slice(aOff, aOff + ivLen)
+  if (ivBuf.length < 16) {
+    const padded = new Uint8Array(16)
+    padded.set(ivBuf)
+    ivBuf = padded
+  }
+
+  // 截取加密数据流
+  const encData = bytes.slice(32 + packPos, 32 + packPos + packSize)
+
+  // 压缩算法类型识别与 Coder Attributes
+  let dataType = 0
+  let coderAttrs = ''
+  if (secondCoder) {
+    if (
+      secondCoder.codecId.length === 3 &&
+      secondCoder.codecId[0] === 0x03 &&
+      secondCoder.codecId[1] === 0x01 &&
+      secondCoder.codecId[2] === 0x01
+    ) {
+      dataType = 1 // LZMA1
+    } else if (secondCoder.codecId.length === 1 && secondCoder.codecId[0] === 0x21) {
+      dataType = 2 // LZMA2
+    } else if (
+      secondCoder.codecId.length === 3 &&
+      secondCoder.codecId[0] === 0x03 &&
+      secondCoder.codecId[1] === 0x04 &&
+      secondCoder.codecId[2] === 0x01
+    ) {
+      dataType = 3 // PPMD
+    } else if (
+      secondCoder.codecId.length === 3 &&
+      secondCoder.codecId[0] === 0x04 &&
+      secondCoder.codecId[1] === 0x02 &&
+      secondCoder.codecId[2] === 0x02
+    ) {
+      dataType = 6 // BZIP2
+    } else if (
+      secondCoder.codecId.length === 3 &&
+      secondCoder.codecId[0] === 0x04 &&
+      secondCoder.codecId[1] === 0x01 &&
+      secondCoder.codecId[2] === 0x08
+    ) {
+      dataType = 7 // DEFLATE
+    }
+
+    if (secondCoder.attributes) {
+      coderAttrs = bufToHex(secondCoder.attributes)
+    }
+  }
+
+  // 生成与 Hashcat Mode 11600 完全对齐的标准哈希串
+  let hashString = ''
+  if (dataType === 0) {
+    hashString = `$7z$0$${numCyclesPower}$${saltLen}$${bufToHex(saltBuf)}$${ivBuf.length}$${bufToHex(ivBuf)}$${crc}$${packSize}$${aesUnpackSize}$${bufToHex(encData)}`
+  } else {
+    hashString = `$7z$${dataType}$${numCyclesPower}$${saltLen}$${bufToHex(saltBuf)}$${ivBuf.length}$${bufToHex(ivBuf)}$${crc}$${packSize}$${aesUnpackSize}$${bufToHex(encData)}$${secondUnpackSize}$${coderAttrs}`
+  }
+
+  const codecName = dataType === 2 ? 'LZMA2' : dataType === 1 ? 'LZMA1' : dataType === 0 ? 'Store' : 'Compressed'
+
   return {
     format: 'file-password-recovery-hash',
     version: 1,
     sourceName: fileName,
     sourceType: '7z',
     hashMode: 11600,
-    hash: '',
-    status: 'blocked',
-    blockedCode: '7Z_STREAM_CLIENT_EXTRACT',
-    blockedReason: '7z 文件名未加密 (Type 1, Mode 11600)',
-    blockedMessage: `该 7z 压缩包文件名未加密（Type 1，Mode 11600），体积为 ${(bytes.length / 1024).toFixed(1)}KB（在 64KB 安全范围内）。由于 7z 复杂数据流解压需调用二进制提取工具，建议直接通过本地配套的「桌面版恢复哈希提取工具」秒级导出轻量哈希交给 GPU 恢复。`,
-    details: `7z (文件名未加密 Type 1, Mode 11600, ${(bytes.length / 1024).toFixed(1)}KB 在安全范围内)`,
+    hash: hashString,
+    status: 'ok',
+    details: `7z (AES-256 + ${codecName}, Mode 11600)`,
+    metadata: {
+      cycles: 1 << numCyclesPower,
+      saltLen,
+      ivLen: ivBuf.length,
+      crc,
+      packSize,
+      aesUnpackSize,
+      secondUnpackSize,
+    },
   }
 }
 
