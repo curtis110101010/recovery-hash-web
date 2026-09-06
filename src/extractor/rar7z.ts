@@ -109,7 +109,7 @@ function parse7z(bytes: Uint8Array, fileName: string): HashPackage {
     blockedCode: '7Z_STREAM_CLIENT_EXTRACT',
     blockedReason: '7z 数据流解密需要专用解析器',
     blockedMessage:
-      '7z 数据流加密 (Type 1, Mode 11600) 建议通过配套的「桌面版恢复哈希提取工具」快速提取轻量哈希。',
+      '7z 数据流加密 (Type 1, Mode 11600) 全量哈希体积严格控制在 64KB 以下。建议通过配套的「桌面版恢复哈希提取工具」快速提取轻量哈希。',
     details: '7z (数据流加密 Type 1, Mode 11600)',
   }
 }
