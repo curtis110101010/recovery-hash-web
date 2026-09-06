@@ -315,10 +315,10 @@ function extract7zType1Hash(bytes: Uint8Array, nextHeader: Uint8Array, fileName:
                 }
                 const isAes =
                   codecId.length === 4 &&
-                  codecId[0] === 0x06 &&
-                  codecId[1] === 0xf1 &&
-                  codecId[2] === 0x07 &&
-                  codecId[3] === 0x01
+                  (codecId[0] & 0xff) === 0x06 &&
+                  (codecId[1] & 0xff) === 0xf1 &&
+                  (codecId[2] & 0xff) === 0x07 &&
+                  (codecId[3] & 0xff) === 0x01
 
                 if (isAes) {
                   aesCoder = { codecId, attributes: attributes || new Uint8Array(0) }
@@ -389,34 +389,35 @@ function extract7zType1Hash(bytes: Uint8Array, nextHeader: Uint8Array, fileName:
   let dataType = 0
   let coderAttrs = ''
   if (secondCoder) {
+    const cid = secondCoder.codecId
     if (
-      secondCoder.codecId.length === 3 &&
-      secondCoder.codecId[0] === 0x03 &&
-      secondCoder.codecId[1] === 0x01 &&
-      secondCoder.codecId[2] === 0x01
+      cid.length === 3 &&
+      (cid[0] & 0xff) === 0x03 &&
+      (cid[1] & 0xff) === 0x01 &&
+      (cid[2] & 0xff) === 0x01
     ) {
       dataType = 1 // LZMA1
-    } else if (secondCoder.codecId.length === 1 && secondCoder.codecId[0] === 0x21) {
+    } else if (cid.length === 1 && (cid[0] & 0xff) === 0x21) {
       dataType = 2 // LZMA2
     } else if (
-      secondCoder.codecId.length === 3 &&
-      secondCoder.codecId[0] === 0x03 &&
-      secondCoder.codecId[1] === 0x04 &&
-      secondCoder.codecId[2] === 0x01
+      cid.length === 3 &&
+      (cid[0] & 0xff) === 0x03 &&
+      (cid[1] & 0xff) === 0x04 &&
+      (cid[2] & 0xff) === 0x01
     ) {
       dataType = 3 // PPMD
     } else if (
-      secondCoder.codecId.length === 3 &&
-      secondCoder.codecId[0] === 0x04 &&
-      secondCoder.codecId[1] === 0x02 &&
-      secondCoder.codecId[2] === 0x02
+      cid.length === 3 &&
+      (cid[0] & 0xff) === 0x04 &&
+      (cid[1] & 0xff) === 0x02 &&
+      (cid[2] & 0xff) === 0x02
     ) {
       dataType = 6 // BZIP2
     } else if (
-      secondCoder.codecId.length === 3 &&
-      secondCoder.codecId[0] === 0x04 &&
-      secondCoder.codecId[1] === 0x01 &&
-      secondCoder.codecId[2] === 0x08
+      cid.length === 3 &&
+      (cid[0] & 0xff) === 0x04 &&
+      (cid[1] & 0xff) === 0x01 &&
+      (cid[2] & 0xff) === 0x08
     ) {
       dataType = 7 // DEFLATE
     }

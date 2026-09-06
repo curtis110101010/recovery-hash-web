@@ -799,7 +799,12 @@ var LZMA = (function () {
         if (sync) {
             this$static.d = $LZMAByteArrayDecompressor({}, byte_arr);
             while ($processChunk(this$static.d.chunker));
-            return decode($toByteArray(this$static.d.output));
+            var rawData = $toByteArray(this$static.d.output);
+            var resBytes = new Uint8Array(rawData.length);
+            for (var _k = 0; _k < rawData.length; _k++) {
+                resBytes[_k] = rawData[_k] & 0xff;
+            }
+            return resBytes;
         }
         
         try {
@@ -857,5 +862,11 @@ var LZMA = (function () {
 
 export function decompressLzmaRaw(bytes: Uint8Array | number[]): Uint8Array {
   const arr = bytes instanceof Uint8Array ? Array.from(bytes) : bytes;
-  return (LZMA.decompress as any)(arr);
+  const res = (LZMA.decompress as any)(arr);
+  if (res instanceof Uint8Array) return res;
+  const out = new Uint8Array(res.length);
+  for (let i = 0; i < res.length; i++) {
+    out[i] = typeof res === 'string' ? res.charCodeAt(i) & 0xff : res[i] & 0xff;
+  }
+  return out;
 }
