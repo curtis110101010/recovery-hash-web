@@ -20,6 +20,11 @@ export interface ExtractionOptions {
   forceFullHash?: boolean
 }
 
+// 7z 全量哈希文件的体积安全阈值上限 64KB
+export const HASH_7Z_BLOCK_MAX_BYTES = 64 * 1024
+export const HASH_7Z_MAX_HASH_BYTES = 64 * 1024
+export const MICRO_HASH_MAX_BYTES = 1024
+
 export function bufToHex(buffer: Uint8Array | ArrayBuffer): string {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer)
   return Array.from(bytes)

@@ -1,4 +1,4 @@
-import { bufToHex } from './types'
+import { bufToHex, HASH_7Z_BLOCK_MAX_BYTES } from './types'
 import type { HashPackage } from './types'
 
 export function inspectRarOr7z(buffer: ArrayBuffer, fileName: string): HashPackage {
@@ -56,6 +56,7 @@ function parse7z(bytes: Uint8Array, fileName: string): HashPackage {
 
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const nextHeaderOffset = Number(view.getBigUint64(12, true))
+  const nextHeaderSize = Number(view.getBigUint64(20, true))
 
   const nextHeaderAbsolute = 32 + nextHeaderOffset
   let isHeaderEncrypted = false
@@ -80,8 +81,42 @@ function parse7z(bytes: Uint8Array, fileName: string): HashPackage {
       blockedCode: '7Z_HEADER_ENCRYPTED_TRAP',
       blockedReason: '勾选了「加密文件名」的 7z 压缩包',
       blockedMessage:
-        '该 7z 启用了「文件名加密」(Type 0)，整个文件树被 LZMA 压缩并整体加密，无独立校验头。若强行提交 GPU 会导致 CPU 单核 100% 满载软解压而 GPU 饥饿假死。请使用本地桌面端或提供未加密文件名的版本。',
+        '该 7z 启用了「文件名加密」(Type 0)，整个文件树被 LZMA 压缩并整体加密，无独立校验头。若强行提交 GPU 会导致 CPU 单核 100% 满载软解压而 GPU 饥饿假死。已智能拦截保护算力。',
       details: '7z (文件名加密 Type 0, 已智能拦截保护算力)',
+    }
+  }
+
+  // 安全判断阈值：7z 头部或加密块超过 64KB 严格拦截
+  if (nextHeaderSize > HASH_7Z_BLOCK_MAX_BYTES) {
+    return {
+      format: 'file-password-recovery-hash',
+      version: 1,
+      sourceName: fileName,
+      sourceType: '7z',
+      hashMode: 11600,
+      hash: '',
+      status: 'blocked',
+      blockedCode: '7Z_HEADER_EXCEEDS_64KB',
+      blockedReason: '7z 头部数据块超过 64KB 安全上限',
+      blockedMessage: `该 7z 头部数据块大小为 ${(nextHeaderSize / 1024).toFixed(1)}KB，超过了 64KB 安全阈值上限。全量流式解压会导致 GPU 严重饥饿与 CPU 假死。`,
+      details: `7z (头部数据块 ${(nextHeaderSize / 1024).toFixed(1)}KB > 64KB)`,
+    }
+  }
+
+  // 检查是否超过 64KB 安全阈值上限
+  if (bytes.length > HASH_7Z_BLOCK_MAX_BYTES) {
+    return {
+      format: 'file-password-recovery-hash',
+      version: 1,
+      sourceName: fileName,
+      sourceType: '7z',
+      hashMode: 11600,
+      hash: '',
+      status: 'blocked',
+      blockedCode: '7Z_STREAM_EXCEEDS_64KB',
+      blockedReason: '7z 加密数据流超过 64KB 安全上限',
+      blockedMessage: `该 7z 加密文件体积为 ${(bytes.length / 1024).toFixed(1)}KB，超过了全量哈希 64KB 安全阈值上限。crc_len / unpack_size 覆盖整条大文件数据流且无中间校验点，必须完整解密解压全部流式数据才能得出 CRC32，已智能拦截以保护 GPU 算力。`,
+      details: `7z (加密数据流 ${(bytes.length / 1024).toFixed(1)}KB > 64KB)`,
     }
   }
 
@@ -110,7 +145,7 @@ function parse7z(bytes: Uint8Array, fileName: string): HashPackage {
     blockedReason: '7z 数据流解密需要专用解析器',
     blockedMessage:
       '7z 数据流加密 (Type 1, Mode 11600) 全量哈希体积严格控制在 64KB 以下。建议通过配套的「桌面版恢复哈希提取工具」快速提取轻量哈希。',
-    details: '7z (数据流加密 Type 1, Mode 11600)',
+    details: '7z (数据流加密 Type 1, Mode 11600, 符合64KB阈值)',
   }
 }
 
