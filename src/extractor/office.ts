@@ -93,14 +93,23 @@ export async function extractOfficeHash(
     const xmlDoc = parser.parseFromString(xmlContent, 'text/xml')
 
     const keyData = xmlDoc.querySelector('keyData')
-    const pEncryptedKey = xmlDoc.querySelector('p\\:encryptedKey, encryptedKey')
+    let pEncryptedKey = xmlDoc.querySelector('p\\:encryptedKey, encryptedKey')
+    if (!pEncryptedKey) {
+      const candidates = xmlDoc.getElementsByTagName('*')
+      for (let i = 0; i < candidates.length; i++) {
+        if (candidates[i].localName === 'encryptedKey' || candidates[i].nodeName.endsWith('encryptedKey')) {
+          pEncryptedKey = candidates[i]
+          break
+        }
+      }
+    }
 
-    const saltValue = keyData?.getAttribute('saltValue') || pEncryptedKey?.getAttribute('saltValue')
+    const saltValue = pEncryptedKey?.getAttribute('saltValue') || keyData?.getAttribute('saltValue')
     const encryptedVerifierHashInput = pEncryptedKey?.getAttribute('encryptedVerifierHashInput')
     const encryptedVerifierHashValue = pEncryptedKey?.getAttribute('encryptedVerifierHashValue')
     const spinCount = pEncryptedKey?.getAttribute('spinCount') || '100000'
-    const keyBits = keyData?.getAttribute('keyBits') || '128'
-    const hashAlgorithm = (keyData?.getAttribute('hashAlgorithm') || pEncryptedKey?.getAttribute('hashAlgorithm') || 'SHA512').toUpperCase()
+    const keyBits = pEncryptedKey?.getAttribute('keyBits') || keyData?.getAttribute('keyBits') || '128'
+    const hashAlgorithm = (pEncryptedKey?.getAttribute('hashAlgorithm') || keyData?.getAttribute('hashAlgorithm') || 'SHA512').toUpperCase()
 
     if (!saltValue || !encryptedVerifierHashInput || !encryptedVerifierHashValue) {
       throw new Error('Office 加密描述块中缺少关键 Salt 或 Verifier 散列参数')
@@ -225,13 +234,22 @@ export async function extractOfficePermission(bytes: Uint8Array, fileName: strin
       'modifyVerifier',
     ]
 
-    for (const tag of tags) {
-      const elem = xmlDoc.querySelector(tag)
-      if (elem) {
-        const saltB64 = elem.getAttribute('saltValue') || elem.getAttribute('salt') || elem.getAttribute('workbookSaltValue')
-        const hashB64 = elem.getAttribute('hashValue') || elem.getAttribute('hash') || elem.getAttribute('workbookHashValue')
-        const spinCount = elem.getAttribute('spinCount') || elem.getAttribute('cryptSpinCount') || elem.getAttribute('workbookSpinCount') || '100000'
-        const alg = elem.getAttribute('algorithmName') || elem.getAttribute('workbookAlgorithmName') || 'SHA-512'
+    const allElems = xmlDoc.getElementsByTagName('*')
+    for (let i = 0; i < allElems.length; i++) {
+      const elem = allElems[i]
+      const localTag = elem.localName || elem.nodeName.split(':').pop() || ''
+      if (tags.includes(localTag)) {
+        const attrs: Record<string, string> = {}
+        for (let j = 0; j < elem.attributes.length; j++) {
+          const attr = elem.attributes[j]
+          const attrKey = attr.localName || attr.name.split(':').pop() || attr.name
+          attrs[attrKey] = attr.value
+        }
+
+        const saltB64 = attrs['saltValue'] || attrs['salt'] || attrs['workbookSaltValue']
+        const hashB64 = attrs['hashValue'] || attrs['hash'] || attrs['workbookHashValue']
+        const spinCount = attrs['spinCount'] || attrs['cryptSpinCount'] || attrs['workbookSpinCount'] || '100000'
+        const alg = attrs['algorithmName'] || attrs['workbookAlgorithmName'] || 'SHA-512'
 
         if (saltB64 && hashB64) {
           const formattedHash = `$office$2016$0$${spinCount}$${saltB64}$${hashB64}`
@@ -252,10 +270,10 @@ export async function extractOfficePermission(bytes: Uint8Array, fileName: strin
             hashMode: 25300,
             hash: formattedHash,
             status: 'ok',
-            details: `Office ${descMap[tag] || tag} (SHA-512, Mode 25300)`,
+            details: `Office ${descMap[localTag] || localTag} (SHA-512, Mode 25300)`,
             metadata: {
               target: 'permission',
-              protectionType: descMap[tag] || tag,
+              protectionType: descMap[localTag] || localTag,
               algorithm: alg,
               spinCount: parseInt(spinCount, 10),
               targetFileInZip: filename,
@@ -263,7 +281,7 @@ export async function extractOfficePermission(bytes: Uint8Array, fileName: strin
           }
         }
 
-        const pwdHex = elem.getAttribute('password') || elem.getAttribute('workbookPassword') || elem.getAttribute('reservationPassword')
+        const pwdHex = attrs['password'] || attrs['workbookPassword'] || attrs['reservationPassword']
         if (pwdHex) {
           return {
             format: 'file-password-recovery-hash',
