@@ -114,6 +114,9 @@ export default function App() {
             <div>
               <div className="flex items-center gap-2">
                 <h1 className="text-lg font-bold tracking-tight text-white">安全恢复哈希提取器</h1>
+                <span className="bg-emerald-500/20 text-emerald-300 text-xs px-2 py-0.5 rounded font-medium border border-emerald-500/30 font-mono">
+                  v1.2.0 (最新版)
+                </span>
                 <span className="bg-sky-500/20 text-sky-300 text-xs px-2 py-0.5 rounded font-medium border border-sky-500/30">
                   淘宝@大希软件服务
                 </span>
@@ -243,7 +246,7 @@ export default function App() {
                 点击选择受保护的文件，或直接拖拽文件到这里
               </p>
               <p className="text-xs text-slate-400">
-                支持 PDF、Word (.docx)、Excel (.xlsx)、PowerPoint (.pptx)、ZIP 压缩包、RAR5
+                支持 PDF、Word、Excel、Powerpoint、ZIP、RAR、7Z文件
               </p>
             </div>
           </div>

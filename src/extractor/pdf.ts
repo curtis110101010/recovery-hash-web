@@ -171,11 +171,20 @@ function findMatchingDict(text: string, startIndex: number): string {
   return ''
 }
 
+function uint8ArrayToBinaryString(bytes: Uint8Array): string {
+  const CHUNK = 32768
+  let str = ''
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    str += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + CHUNK, bytes.length)) as unknown as number[])
+  }
+  return str
+}
+
 export function extractPdfHash(buffer: ArrayBuffer, fileName: string, target: 'open' | 'permission' = 'open'): HashPackage {
   const bytes = new Uint8Array(buffer)
-  // Decode text using latin1 to keep 1-to-1 byte positions for ASCII structure
-  const decoder = new TextDecoder('latin1')
-  const content = decoder.decode(bytes)
+  // 必须使用 String.fromCharCode 保持 0x00-0xFF 纯 8 位字节无损映射，
+  // 严禁使用 TextDecoder('latin1')，因浏览器 WHATWG 规范会将 0x80-0x9F 重定向为 Windows-1252 从而彻底破坏原始哈希字节！
+  const content = uint8ArrayToBinaryString(bytes)
 
   if (!content.includes('/Encrypt')) {
     throw new Error('该 PDF 文件未加密，没有设置密码保护')
@@ -238,7 +247,7 @@ export function extractPdfHash(buffer: ArrayBuffer, fileName: string, target: 'o
   const encryptMetadata = encryptMetaMatch && encryptMetaMatch[1].toLowerCase() === 'false' ? 0 : 1
 
   // 3. Document ID (/ID [ <hex> <hex> ])
-  let documentIdBytes: Uint8Array<any> = new Uint8Array(16)
+  let documentIdBytes: Uint8Array = new Uint8Array(16)
   const idMatch = content.match(/\/ID\s*\[\s*([<(\s\S]*?)\]/)
   if (idMatch) {
     const idInner = idMatch[1].trim()
@@ -253,11 +262,28 @@ export function extractPdfHash(buffer: ArrayBuffer, fileName: string, target: 'o
   const passwordFields: string[] = []
 
   const extractEntry = (key: string): Uint8Array | null => {
-    // Match /Key <hex> or /Key (...)
-    const regex = new RegExp(`\\/${key}\\s*(<[0-9a-fA-F\\s]+>|\\([\\s\\S]*?\\)(?=[\\s/<>]))`, 'm')
-    const match = encryptDictStr.match(regex)
-    if (match) {
-      return decodePdfString(match[1])
+    const idx = encryptDictStr.search(new RegExp(`\\/${key}[\\s<(]`))
+    if (idx === -1) return null
+    let p = idx + key.length + 1
+    while (p < encryptDictStr.length && /\s/.test(encryptDictStr[p])) p++
+    if (encryptDictStr[p] === '<') {
+      const end = encryptDictStr.indexOf('>', p)
+      if (end !== -1) {
+        return decodePdfString(encryptDictStr.substring(p, end + 1))
+      }
+    } else if (encryptDictStr[p] === '(') {
+      let depth = 1
+      let i = p + 1
+      while (i < encryptDictStr.length && depth > 0) {
+        if (encryptDictStr[i] === '\\') {
+          i += 2
+          continue
+        }
+        if (encryptDictStr[i] === '(') depth++
+        else if (encryptDictStr[i] === ')') depth--
+        i++
+      }
+      return decodePdfString(encryptDictStr.substring(p, i))
     }
     return null
   }
