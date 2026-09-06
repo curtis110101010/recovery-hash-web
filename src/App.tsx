@@ -18,7 +18,7 @@ import type { HashPackage, ExtractionOptions } from './extractor'
 import './App.css'
 
 export default function App() {
-  const [, setFile] = useState<File | null>(null)
+  const [file, setFile] = useState<File | null>(null)
   const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<HashPackage | null>(null)
@@ -44,7 +44,7 @@ export default function App() {
     }
   }, [])
 
-  const handleProcess = async (selectedFile: File) => {
+  const handleProcess = async (selectedFile: File, overrideOpts?: ExtractionOptions) => {
     setFile(selectedFile)
     setLoading(true)
     setError(null)
@@ -56,6 +56,7 @@ export default function App() {
       const opts: ExtractionOptions = {
         pdfTarget,
         officeTarget,
+        ...overrideOpts,
       }
       const pkg = await extractHashFromFile(selectedFile, opts)
       setResult(pkg)
@@ -260,9 +261,35 @@ export default function App() {
         {error && (
           <div className="mt-6 p-4 rounded-xl bg-red-950/40 border border-red-800/60 flex items-start gap-3 text-red-200">
             <AlertTriangle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
-            <div className="text-xs">
+            <div className="text-xs flex-1">
               <strong className="block text-red-300 font-semibold mb-0.5">解析提示</strong>
-              {error}
+              <p className="leading-relaxed">{error}</p>
+              {error.includes('切换为「权限/编辑密码 (25400)」') && file && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPdfTarget('permission')
+                    handleProcess(file, { pdfTarget: 'permission', officeTarget })
+                  }}
+                  className="mt-3 inline-flex items-center gap-1.5 px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-lg font-medium text-xs transition shadow cursor-pointer"
+                >
+                  <KeyRound className="w-3.5 h-3.5" />
+                  一键切换为「权限/编辑密码 (25400)」并重新提取
+                </button>
+              )}
+              {error.includes('切换为「工作表/限制编辑') && file && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOfficeTarget('permission')
+                    handleProcess(file, { pdfTarget, officeTarget: 'permission' })
+                  }}
+                  className="mt-3 inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg font-medium text-xs transition shadow cursor-pointer"
+                >
+                  <KeyRound className="w-3.5 h-3.5" />
+                  一键切换为「工作表/限制编辑」并重新提取
+                </button>
+              )}
             </div>
           </div>
         )}

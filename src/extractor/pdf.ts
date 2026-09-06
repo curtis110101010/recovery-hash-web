@@ -1,5 +1,94 @@
 import { bufToHex } from './types'
 import type { HashPackage } from './types'
+import { md5, rc4, sha256 } from './crypto'
+
+const PDF_PADDING = new Uint8Array([
+  0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41,
+  0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,
+  0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80,
+  0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a,
+])
+
+/**
+ * 依据 ISO 32000-1 规范校验 PDF 打开密码是否为空字符串 \"\"。
+ * 若校验通过，说明文档任何人无需密码即可直接打开阅读。
+ */
+function isPdfUserPasswordEmpty(
+  revision: number,
+  keyBits: number,
+  permissions: number,
+  encryptMetadata: number,
+  documentIdBytes: Uint8Array,
+  oBytes: Uint8Array | null,
+  uBytes: Uint8Array | null
+): boolean {
+  if (!uBytes || !oBytes) return false
+
+  if (revision <= 4) {
+    const keyLen = revision <= 2 ? 5 : Math.floor(keyBits / 8)
+    const pDv = new DataView(new ArrayBuffer(4))
+    pDv.setInt32(0, permissions, true)
+    const pBytes = new Uint8Array(pDv.buffer)
+
+    // Algorithm 2: Compute key for empty user password
+    const parts = [PDF_PADDING, oBytes, pBytes, documentIdBytes]
+    if (revision >= 4 && encryptMetadata === 0) {
+      parts.push(new Uint8Array([0xff, 0xff, 0xff, 0xff]))
+    }
+    const totalLen = parts.reduce((acc, p) => acc + p.length, 0)
+    const combined = new Uint8Array(totalLen)
+    let pos = 0
+    for (const part of parts) {
+      combined.set(part, pos)
+      pos += part.length
+    }
+
+    let digest = md5(combined)
+    if (revision >= 3) {
+      for (let i = 0; i < 50; i++) {
+        digest = md5(digest.slice(0, keyLen))
+      }
+    }
+    const key = digest.slice(0, keyLen)
+
+    // Algorithm 6 / 7: Authenticating user password
+    if (revision <= 2) {
+      if (uBytes.length < 32) return false
+      const res = rc4(key, PDF_PADDING)
+      for (let i = 0; i < 32; i++) {
+        if (res[i] !== uBytes[i]) return false
+      }
+      return true
+    } else {
+      if (uBytes.length < 16) return false
+      const parts2 = new Uint8Array(PDF_PADDING.length + documentIdBytes.length)
+      parts2.set(PDF_PADDING, 0)
+      parts2.set(documentIdBytes, PDF_PADDING.length)
+      let out = rc4(key, md5(parts2))
+      for (let i = 1; i <= 19; i++) {
+        const ki = new Uint8Array(key.length)
+        for (let j = 0; j < key.length; j++) ki[j] = key[j] ^ i
+        out = rc4(ki, out)
+      }
+      for (let i = 0; i < 16; i++) {
+        if (out[i] !== uBytes[i]) return false
+      }
+      return true
+    }
+  }
+
+  // Revision 5 (AES-256): U has 48 bytes (32 hash + 8 validation salt + 8 key salt)
+  if (revision === 5 && uBytes.length >= 40) {
+    const validationSalt = uBytes.slice(32, 40)
+    const expected = sha256(validationSalt)
+    for (let i = 0; i < 32; i++) {
+      if (expected[i] !== uBytes[i]) return false
+    }
+    return true
+  }
+
+  return false
+}
 
 function decodePdfString(raw: string): Uint8Array {
   const trimmed = raw.trim()
@@ -173,6 +262,40 @@ export function extractPdfHash(buffer: ArrayBuffer, fileName: string, target: 'o
     return null
   }
 
+  const uBytes = extractEntry('U')
+  const oBytes = extractEntry('O')
+
+  // 5. 智能前置校验：打开密码 vs 权限限制密码
+  if (target === 'open') {
+    const userPassIsEmpty = isPdfUserPasswordEmpty(
+      revision,
+      keyLength,
+      permissions,
+      encryptMetadata,
+      documentIdBytes,
+      oBytes,
+      uBytes
+    )
+
+    if (userPassIsEmpty) {
+      if ((oBytes && oBytes.length > 0) || permissions !== -4) {
+        throw new Error(
+          '该 PDF 文档未设置打开密码（任何人均可直接正常打开阅读），但检测到设置了权限限制密码！请将左侧「PDF 提取目标」切换为「权限/编辑密码 (25400)」进行提取。'
+        )
+      }
+      throw new Error('该 PDF 文件未设置任何密码保护（无打开密码，亦无权限限制）。')
+    }
+  } else if (target === 'permission') {
+    if (!oBytes || oBytes.length === 0) {
+      throw new Error('该 PDF 文档未设置权限/所有者密码，请将左侧「PDF 提取目标」切换为「打开密码」进行提取。')
+    }
+    if (revision !== 3 && revision !== 4) {
+      throw new Error(
+        `Hashcat GPU 模式暂不支持 PDF R=${revision} 的权限密码恢复（仅支持 PDF 1.4-1.6 的 128 位加密），请使用客户端恢复工具的 CPU 模式。`
+      )
+    }
+  }
+
   for (const key of ['U', 'O', 'OE', 'UE']) {
     const rawBytes = extractEntry(key)
     if (rawBytes && rawBytes.length > 0) {
@@ -198,13 +321,7 @@ export function extractPdfHash(buffer: ArrayBuffer, fileName: string, target: 'o
 
   let hashMode = 0
   if (target === 'permission') {
-    if (revision === 3 || revision === 4) {
-      hashMode = 25400
-    } else {
-      throw new Error(
-        `Hashcat GPU 模式暂不支持 PDF R=${revision} 的权限密码恢复（仅支持 PDF 1.4-1.6），请使用打开密码模式`
-      )
-    }
+    hashMode = 25400
   } else {
     const modeMap: Record<number, number> = {
       2: 10400,
@@ -227,7 +344,7 @@ export function extractPdfHash(buffer: ArrayBuffer, fileName: string, target: 'o
     hashMode,
     hash: pdfHash,
     status: 'ok',
-    details: `PDF (R=${revision}, V=${algorithm}, ${keyLength}位, ${target === 'permission' ? '权限密码' : '打开密码'})`,
+    details: `PDF (R=${revision}, V=${algorithm}, ${keyLength}位, ${target === 'permission' ? '权限限制密码' : '打开密码'})`,
     metadata: {
       revision,
       algorithm,
