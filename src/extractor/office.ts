@@ -10,11 +10,6 @@ export async function extractOfficeHash(
 ): Promise<HashPackage> {
   const bytes = new Uint8Array(buffer)
 
-  // If user requested permission/protection password or file is unencrypted ZIP
-  if (target === 'permission') {
-    return extractOfficePermission(bytes, fileName)
-  }
-
   // Check for OLE container (starts with D0 CF 11 E0 A1 B1 1A E1)
   const isOle =
     bytes.length > 8 &&
@@ -27,14 +22,24 @@ export async function extractOfficeHash(
     bytes[6] === 0x1a &&
     bytes[7] === 0xe1
 
+  // If user requested permission/protection password
+  if (target === 'permission') {
+    if (isOle) {
+      throw new Error('该文档设置了强加密打开密码（未解除打开密码前无法读取内部工作表），请先将目标切换为「打开密码」提取并找回打开密码！')
+    }
+    return extractOfficePermission(bytes, fileName)
+  }
+
   if (!isOle) {
     // Might be unencrypted OOXML zip or other format
     if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
-      // It's a standard ZIP container - does it have protection/permission passwords?
+      // It's a standard ZIP container - check if it has protection/permission passwords
       try {
-        return await extractOfficePermission(bytes, fileName)
-      } catch {
-        throw new Error('该 Office 文档未设置打开密码，也没有工作表/编辑限制保护')
+        const permPackage = await extractOfficePermission(bytes, fileName)
+        throw new Error(`该文档未设置打开密码（任何人均可直接正常打开阅读），但检测到设置了【${permPackage.details}】！请将 OFFICE 提取目标切换为「工作表/限制编辑 (25300/XOR)」进行提取。`)
+      } catch (err: any) {
+        if (err.message.includes('未设置打开密码')) throw err
+        throw new Error('该 Office 文档未设置打开密码，也没有工作表/编辑限制保护。')
       }
     }
     throw new Error('该文件不是有效的 Office 加密文档 (OLE/OOXML)')
