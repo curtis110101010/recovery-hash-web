@@ -59,16 +59,38 @@ function parse7z(bytes: Uint8Array, fileName: string): HashPackage {
   const nextHeaderSize = Number(view.getBigUint64(20, true))
 
   const nextHeaderAbsolute = 32 + nextHeaderOffset
+  const nextHeader = bytes.slice(nextHeaderAbsolute, nextHeaderAbsolute + nextHeaderSize)
   let isHeaderEncrypted = false
 
-  if (nextHeaderAbsolute >= 0 && nextHeaderAbsolute < bytes.length) {
-    const firstByte = bytes[nextHeaderAbsolute]
-    if (firstByte === 0x17) {
-      // kEncodedHeader: Header itself is encrypted (Type 0)
+  if (nextHeader.length > 0) {
+    const firstByte = nextHeader[0]
+    if (firstByte === 0x01) {
+      // kHeader: 普通未压缩头 -> 文件名明文可见，未加密 (Type 1)
+      isHeaderEncrypted = false
+    } else if (firstByte === 0x17) {
+      // kEncodedHeader: 编码（压缩）头。
+      // 注意：7-Zip 默认即使未勾选“加密文件名”，也会使用 LZMA 压缩目录结构头（firstByte 为 0x17）。
+      // 只有当编码头内部明确包含 AES 编码器 (06 F1 07 01) 时，头部才真正被加密（Type 0）。
+      let hasAesInHeader = false
+      for (let i = 0; i <= nextHeader.length - 4; i++) {
+        if (
+          nextHeader[i] === 0x06 &&
+          nextHeader[i + 1] === 0xf1 &&
+          nextHeader[i + 2] === 0x07 &&
+          nextHeader[i + 3] === 0x01
+        ) {
+          hasAesInHeader = true
+          break
+        }
+      }
+      isHeaderEncrypted = hasAesInHeader
+    } else {
+      // 既不是 0x01 也不是 0x17：整头直接加密的随机字节
       isHeaderEncrypted = true
     }
   }
 
+  // 1. 文件名真正被加密 (Type 0)
   if (isHeaderEncrypted) {
     return {
       format: 'file-password-recovery-hash',
@@ -79,14 +101,14 @@ function parse7z(bytes: Uint8Array, fileName: string): HashPackage {
       hash: '',
       status: 'blocked',
       blockedCode: '7Z_HEADER_ENCRYPTED_TRAP',
-      blockedReason: '勾选了「加密文件名」的 7z 压缩包',
+      blockedReason: '勾选了「加密文件名」的 7z 压缩包 (Type 0)',
       blockedMessage:
-        '该 7z 启用了「文件名加密」(Type 0)，整个文件树被 LZMA 压缩并整体加密，无独立校验头。若强行提交 GPU 会导致 CPU 单核 100% 满载软解压而 GPU 饥饿假死。已智能拦截保护算力。',
+        '该 7z 启用了「文件名加密」(Type 0)，整个文件树被 LZMA 压缩并整体加密，无独立校验头。若强行提交 GPU 会导致 CPU 单核 100% 满载软解压而 GPU 饥饿假死。已智能拦截以保护算力。',
       details: '7z (文件名加密 Type 0, 已智能拦截保护算力)',
     }
   }
 
-  // 安全判断阈值：7z 头部或加密块超过 64KB 严格拦截
+  // 2. 文件名未加密 (Type 1) - 安全判断阈值控制在 64KB 以下
   if (nextHeaderSize > HASH_7Z_BLOCK_MAX_BYTES) {
     return {
       format: 'file-password-recovery-hash',
@@ -103,7 +125,7 @@ function parse7z(bytes: Uint8Array, fileName: string): HashPackage {
     }
   }
 
-  // 检查是否超过 64KB 安全阈值上限
+  // 检查加密数据流或文件总大小是否超过 64KB 安全阈值上限
   if (bytes.length > HASH_7Z_BLOCK_MAX_BYTES) {
     return {
       format: 'file-password-recovery-hash',
@@ -120,19 +142,7 @@ function parse7z(bytes: Uint8Array, fileName: string): HashPackage {
     }
   }
 
-  // Search for AES coder identifier: 06 F1 07 01
-  let foundAes = false
-  for (let i = 32; i < Math.min(bytes.length - 4, 1024 * 1024); i++) {
-    if (bytes[i] === 0x06 && bytes[i + 1] === 0xf1 && bytes[i + 2] === 0x07 && bytes[i + 3] === 0x01) {
-      foundAes = true
-      break
-    }
-  }
-
-  if (!foundAes) {
-    throw new Error('该 7z 文件未检测到 AES 加密数据流')
-  }
-
+  // 3. 文件名未加密且体积在 64KB 安全范围内
   return {
     format: 'file-password-recovery-hash',
     version: 1,
@@ -142,10 +152,9 @@ function parse7z(bytes: Uint8Array, fileName: string): HashPackage {
     hash: '',
     status: 'blocked',
     blockedCode: '7Z_STREAM_CLIENT_EXTRACT',
-    blockedReason: '7z 数据流解密需要专用解析器',
-    blockedMessage:
-      '7z 数据流加密 (Type 1, Mode 11600) 全量哈希体积严格控制在 64KB 以下。建议通过配套的「桌面版恢复哈希提取工具」快速提取轻量哈希。',
-    details: '7z (数据流加密 Type 1, Mode 11600, 符合64KB阈值)',
+    blockedReason: '7z 文件名未加密 (Type 1, Mode 11600)',
+    blockedMessage: `该 7z 压缩包文件名未加密（Type 1，Mode 11600），体积为 ${(bytes.length / 1024).toFixed(1)}KB（在 64KB 安全范围内）。由于 7z 复杂数据流解压需调用二进制提取工具，建议直接通过本地配套的「桌面版恢复哈希提取工具」秒级导出轻量哈希交给 GPU 恢复。`,
+    details: `7z (文件名未加密 Type 1, Mode 11600, ${(bytes.length / 1024).toFixed(1)}KB 在安全范围内)`,
   }
 }
 
