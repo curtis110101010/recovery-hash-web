@@ -480,27 +480,35 @@ function parseRar5(bytes: Uint8Array, fileName: string): HashPackage {
     offset += typeLen
 
     // Read header flags (vint)
-    const [, flagsLen] = readVint(bytes, offset)
+    const [flags, flagsLen] = readVint(bytes, offset)
     offset += flagsLen
 
+    // Case 1: Archive encryption header (HEAD_CRYPT = 4, 文件名加密)
     if (headerType === 4) {
-      // Archive encryption header (Type 4)
       foundEnc = true
       const [, verLen] = readVint(bytes, offset)
       offset += verLen
-      const [, encFlagsLen] = readVint(bytes, offset)
+      const [encFlags, encFlagsLen] = readVint(bytes, offset)
       offset += encFlagsLen
 
-      const kdfCount = bytes[offset]
-      offset += 1
+      const kdfCount = bytes[offset++]
       const salt = bytes.slice(offset, offset + 16)
       offset += 16
-      const checkVal = bytes.slice(offset, offset + 12)
+      let pswCheck: Uint8Array | null = null
+      if ((encFlags & 0x01) !== 0) {
+        pswCheck = bytes.slice(offset, offset + 8)
+        offset += 8
+        offset += 4 // 跳过 4 字节 check CRC
+      }
 
+      // RAR5 文件名加密时，HEAD_CRYPT 块紧接着的 16 字节为加密头流的初始向量 (IV)
+      const iv = bytes.slice(headerEnd, headerEnd + 16)
       const saltHex = bufToHex(salt)
-      const checkHex = bufToHex(checkVal)
+      const ivHex = bufToHex(iv)
+      const pswCheckHex = pswCheck ? bufToHex(pswCheck) : '0000000000000000'
 
-      const rar5Hash = `$rar5$16$${saltHex}$${kdfCount}$${checkHex}$0`
+      // Hashcat Mode 13000 标准格式：$rar5$<salt_len>$<salt>$<iter_log2>$<iv>$<check_len>$<psw_check>
+      const rar5Hash = `$rar5$16$${saltHex}$${kdfCount}$${ivHex}$8$${pswCheckHex}`
 
       return {
         format: 'file-password-recovery-hash',
@@ -515,7 +523,73 @@ function parseRar5(bytes: Uint8Array, fileName: string): HashPackage {
           rarVersion: 5,
           kdfCount,
           saltHex,
+          ivHex,
         },
+      }
+    }
+
+    // Case 2: File header (HEAD_FILE = 2) 或 Service header (HEAD_SERVICE = 3, 文件名明文可见)
+    if (headerType === 2 || headerType === 3) {
+      let extraSize = 0
+      if ((flags & 0x0001) !== 0) {
+        const [es, esLen] = readVint(bytes, offset)
+        extraSize = es
+        offset += esLen
+      }
+      if ((flags & 0x0002) !== 0) {
+        const [, dsLen] = readVint(bytes, offset)
+        offset += dsLen
+      }
+
+      // 若包含 Extra 扩展块，遍历查找文件加密扩展 (FHEXTRA_CRYPT = 1)
+      if (extraSize > 0) {
+        let extraOffset = headerEnd - extraSize
+        while (extraOffset < headerEnd) {
+          const [fieldSize, fsLen] = readVint(bytes, extraOffset)
+          extraOffset += fsLen
+          const fieldEnd = extraOffset + fieldSize
+          const [fieldType, ftLen] = readVint(bytes, extraOffset)
+          extraOffset += ftLen
+
+          if (fieldType === 1) {
+            // FHEXTRA_CRYPT = 1
+            foundEnc = true
+            const [, cvLen] = readVint(bytes, extraOffset)
+            extraOffset += cvLen
+            const [, efLen] = readVint(bytes, extraOffset)
+            extraOffset += efLen
+            const kdfCount = bytes[extraOffset++]
+            const salt = bytes.slice(extraOffset, extraOffset + 16)
+            extraOffset += 16
+            const iv = bytes.slice(extraOffset, extraOffset + 16)
+            extraOffset += 16
+            const pswCheck = bytes.slice(extraOffset, extraOffset + 8)
+
+            const saltHex = bufToHex(salt)
+            const ivHex = bufToHex(iv)
+            const pswCheckHex = bufToHex(pswCheck)
+
+            const rar5Hash = `$rar5$16$${saltHex}$${kdfCount}$${ivHex}$8$${pswCheckHex}`
+
+            return {
+              format: 'file-password-recovery-hash',
+              version: 1,
+              sourceName: fileName,
+              sourceType: 'rar',
+              hashMode: 13000,
+              hash: rar5Hash,
+              status: 'ok',
+              details: 'RAR5 (原生 PBKDF2-HMAC-SHA256, Mode 13000)',
+              metadata: {
+                rarVersion: 5,
+                kdfCount,
+                saltHex,
+                ivHex,
+              },
+            }
+          }
+          extraOffset = fieldEnd
+        }
       }
     }
 
@@ -523,7 +597,7 @@ function parseRar5(bytes: Uint8Array, fileName: string): HashPackage {
   }
 
   if (!foundEnc) {
-    throw new Error('该 RAR5 压缩包未发现主加密头，请使用桌面端提取器')
+    throw new Error('该 RAR5 压缩包未发现主加密头或加密文件记录')
   }
 
   throw new Error('未能从 RAR5 中提取有效哈希')
